@@ -51,19 +51,36 @@ pub(crate) struct DeviceInfoEncrypted {
 #[serde(rename_all = "camelCase")]
 /// kept in sync with https://github.com/signalapp/Signal-Server/blob/main/service/src/main/java/org/whispersystems/textsecuregcm/entities/AccountAttributes.java#L25
 pub struct AccountAttributes {
-    pub fetches_messages: bool,
+    // signalingKey: String?,
+    // #[serde(default, skip_serializing_if = "Option::is_none")]
+    // pub signaling_key: Option<String>,
+    // registrationId: Int,
     pub registration_id: u32,
-    pub pni_registration_id: u32,
-    #[serde(default, with = "serde_optional_prost_base64")]
-    pub name: Option<DeviceName>,
+    // voice: Boolean,
+    pub voice: bool,
+    // video: Boolean,
+    pub video: bool,
+    // fetchesMessages: Boolean,
+    pub fetches_messages: bool,
+    // registrationLock: String?,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_lock: Option<String>,
+    // unidentifiedAccessKey: ByteArray?,
     #[serde(default, with = "serde_optional_base64")]
     pub unidentified_access_key: Option<Vec<u8>>,
+    // unrestrictedUnidentifiedAccess: Boolean,
     pub unrestricted_unidentified_access: bool,
-    pub capabilities: DeviceCapabilities,
+    // discoverableByPhoneNumber: Boolean,
     pub discoverable_by_phone_number: bool,
-    pub pin: Option<String>,
+    // capabilities: Capabilities?,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<DeviceCapabilities>,
+    // name: String?,
+    #[serde(default, with = "serde_optional_prost_base64")]
+    pub name: Option<DeviceName>,
+    // pniRegistrationId: Int,
+    pub pni_registration_id: u32,
+    // recoveryPassword: String?
     #[serde(
         default,
         with = "serde_optional_base64",
@@ -146,11 +163,6 @@ impl SignalWebSocket<websocket::Identified> {
         &mut self,
         attributes: AccountAttributes,
     ) -> Result<(), ServiceError> {
-        assert!(
-            attributes.pin.is_none() || attributes.registration_lock.is_none(),
-            "only one of PIN and registration lock can be set."
-        );
-
         self.http_request(Method::PUT, "/v1/accounts/attributes")?
             .send_json(&attributes)
             .await?
