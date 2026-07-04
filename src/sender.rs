@@ -160,7 +160,13 @@ pub enum ThreadIdentifier {
 #[derive(Debug)]
 pub struct EncryptedMessages {
     messages: Vec<OutgoingPushMessage>,
-    used_identity_key: IdentityKey,
+}
+
+/// Outcome of attempting to recover from a send error: retry the loop, or
+/// give up and propagate.
+enum SendRecovery {
+    Retry,
+    Terminal(MessageSenderError),
 }
 
 impl<S> MessageSender<S>
@@ -671,6 +677,145 @@ where
         results
     }
 
+    /// Handle the `Err` arm of a websocket send, shared by the sender-key and
+    /// 1:1 send retry loops. Performs session bookkeeping for
+    /// `MismatchedDevicesException`/`StaleDevices` so the caller can rebuild and
+    /// retry; all other errors are terminal.
+    async fn recover_from_send_error(
+        &mut self,
+        recipient: ServiceId,
+        err: ServiceError,
+    ) -> Result<SendRecovery, MessageSenderError> {
+        match err {
+            ServiceError::MismatchedDevicesException(ref m) => {
+                tracing::debug!("{:?}", m);
+                for extra_device_id in &m.extra_devices {
+                    tracing::debug!(
+                        "dropping session with device {}",
+                        extra_device_id
+                    );
+                    self.protocol_store
+                        .delete_service_addr_device_session(
+                            &recipient.to_protocol_address(*extra_device_id)?,
+                        )
+                        .await?;
+                }
+
+                for missing_device_id in &m.missing_devices {
+                    tracing::debug!(
+                        "creating session with missing device {}",
+                        missing_device_id
+                    );
+                    let remote_address =
+                        recipient.to_protocol_address(*missing_device_id)?;
+                    let mut rng = rng();
+                    let pre_key = self
+                        .identified_ws
+                        .get_pre_key(&recipient, *missing_device_id)
+                        .await?;
+
+                    process_prekey_bundle(
+                        &remote_address,
+                        &self
+                            .local_aci
+                            .to_protocol_address(self.device_id)
+                            .expect("valid device id"),
+                        &mut self.protocol_store.clone(),
+                        &mut self.protocol_store,
+                        &pre_key,
+                        SystemTime::now(),
+                        &mut rng,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("failed to create session: {}", e);
+                        MessageSenderError::UntrustedIdentity {
+                            address: recipient,
+                        }
+                    })?;
+                }
+                Ok(SendRecovery::Retry)
+            },
+            ServiceError::StaleDevices(ref m) => {
+                tracing::debug!("{:?}", m);
+                for extra_device_id in &m.stale_devices {
+                    tracing::debug!(
+                        "dropping session with device {}",
+                        extra_device_id
+                    );
+                    self.protocol_store
+                        .delete_service_addr_device_session(
+                            &recipient.to_protocol_address(*extra_device_id)?,
+                        )
+                        .await?;
+                }
+                Ok(SendRecovery::Retry)
+            },
+            ServiceError::ProofRequiredError(ref p) => {
+                tracing::debug!("{:?}", p);
+                Ok(SendRecovery::Terminal(MessageSenderError::ProofRequired {
+                    token: p.token.clone(),
+                    options: p.options.clone(),
+                }))
+            },
+            ServiceError::NotFoundError => {
+                tracing::debug!("Not found when sending a message");
+                Ok(SendRecovery::Terminal(MessageSenderError::NotFound {
+                    service_id: recipient,
+                }))
+            },
+            e => {
+                tracing::debug!(
+                    "Default error handler for ws.send_messages: {}",
+                    e
+                );
+                Ok(SendRecovery::Terminal(MessageSenderError::ServiceError(e)))
+            },
+        }
+    }
+
+    /// Dispatch a built `OutgoingPushMessages` to the websocket, via the
+    /// unidentified channel when `unidentified_access` is supplied, else the
+    /// identified channel.
+    async fn dispatch_outgoing(
+        &mut self,
+        messages: OutgoingPushMessages,
+        unidentified_access: Option<&UnidentifiedAccess>,
+    ) -> Result<SendMessageResponse, ServiceError> {
+        if let Some(unidentified) = unidentified_access {
+            tracing::debug!("sending via unidentified");
+            self.unidentified_ws
+                .send_messages_unidentified(messages, unidentified)
+                .await
+        } else {
+            tracing::debug!("sending identified");
+            self.identified_ws.send_messages(messages).await
+        }
+    }
+
+    /// Build the `SentMessage` result after a successful dispatch, looking up
+    /// the recipient's identity key on the default device.
+    async fn build_sent_message(
+        &mut self,
+        recipient: ServiceId,
+        unidentified: bool,
+        needs_sync: bool,
+    ) -> Result<SentMessage, MessageSenderError> {
+        let used_identity_key = self
+            .protocol_store
+            .get_identity(&recipient.to_protocol_address(*DEFAULT_DEVICE_ID)?)
+            .await?
+            .ok_or(MessageSenderError::UntrustedIdentity {
+                address: recipient,
+            })?;
+        Ok(SentMessage {
+            recipient,
+            used_identity_key,
+            unidentified,
+            needs_sync,
+        })
+    }
+
     /// Build per-device sealed-sender SenderKey messages for a single recipient
     /// and send them via the sealed-sender path with the full retry loop.
     async fn send_sender_key_to_recipient(
@@ -768,115 +913,20 @@ where
                 online,
             };
 
-            let send = self
-                .unidentified_ws
-                .send_messages_unidentified(messages, unidentified_access)
+            let result = self
+                .dispatch_outgoing(messages, Some(unidentified_access))
                 .await;
-
-            match send {
+            match result {
                 Ok(SendMessageResponse { needs_sync }) => {
-                    let used_identity_key = self
-                        .protocol_store
-                        .get_identity(
-                            &recipient
-                                .to_protocol_address(*DEFAULT_DEVICE_ID)?,
-                        )
-                        .await?
-                        .ok_or(MessageSenderError::UntrustedIdentity {
-                            address: recipient,
-                        })?;
-                    return Ok(SentMessage {
-                        recipient,
-                        used_identity_key,
-                        unidentified: true,
-                        needs_sync,
-                    });
-                },
-                Err(ServiceError::MismatchedDevicesException(ref m)) => {
-                    tracing::debug!("{:?}", m);
-                    for extra_device_id in &m.extra_devices {
-                        tracing::debug!(
-                            "dropping session with device {}",
-                            extra_device_id
-                        );
-                        self.protocol_store
-                            .delete_service_addr_device_session(
-                                &recipient
-                                    .to_protocol_address(*extra_device_id)?,
-                            )
-                            .await?;
-                    }
-
-                    for missing_device_id in &m.missing_devices {
-                        tracing::debug!(
-                            "creating session with missing device {}",
-                            missing_device_id
-                        );
-                        let remote_address = recipient
-                            .to_protocol_address(*missing_device_id)?;
-                        let mut rng = rng();
-                        let pre_key = self
-                            .identified_ws
-                            .get_pre_key(&recipient, *missing_device_id)
-                            .await?;
-
-                        process_prekey_bundle(
-                            &remote_address,
-                            &self
-                                .local_aci
-                                .to_protocol_address(self.device_id)
-                                .expect("valid device id"),
-                            &mut self.protocol_store.clone(),
-                            &mut self.protocol_store.clone(),
-                            &pre_key,
-                            SystemTime::now(),
-                            &mut rng,
-                        )
-                        .await
-                        .map_err(|e| {
-                            error!("failed to create session: {}", e);
-                            MessageSenderError::UntrustedIdentity {
-                                address: recipient,
-                            }
-                        })?;
-                    }
-                    // Loop to rebuild messages with the updated sessions.
-                },
-                Err(ServiceError::StaleDevices(ref m)) => {
-                    tracing::debug!("{:?}", m);
-                    for extra_device_id in &m.stale_devices {
-                        tracing::debug!(
-                            "dropping session with device {}",
-                            extra_device_id
-                        );
-                        self.protocol_store
-                            .delete_service_addr_device_session(
-                                &recipient
-                                    .to_protocol_address(*extra_device_id)?,
-                            )
-                            .await?;
-                    }
-                    // Loop to rebuild messages.
-                },
-                Err(ServiceError::ProofRequiredError(ref p)) => {
-                    tracing::debug!("{:?}", p);
-                    return Err(MessageSenderError::ProofRequired {
-                        token: p.token.clone(),
-                        options: p.options.clone(),
-                    });
-                },
-                Err(ServiceError::NotFoundError) => {
-                    tracing::debug!("Not found when sending a message");
-                    return Err(MessageSenderError::NotFound {
-                        service_id: recipient,
-                    });
+                    return self
+                        .build_sent_message(recipient, true, needs_sync)
+                        .await;
                 },
                 Err(e) => {
-                    tracing::debug!(
-                        "Default error handler for ws.send_messages: {}",
-                        e
-                    );
-                    return Err(MessageSenderError::ServiceError(e));
+                    match self.recover_from_send_error(recipient, e).await? {
+                        SendRecovery::Retry => {},
+                        SendRecovery::Terminal(err) => return Err(err),
+                    }
                 },
             }
         }
@@ -910,13 +960,8 @@ where
 
         let content_bytes = content.encode_to_vec();
 
-        let mut rng = rng();
-
         for _ in 0..4u8 {
-            let Some(EncryptedMessages {
-                messages,
-                used_identity_key,
-            }) = self
+            let Some(EncryptedMessages { messages, .. }) = self
                 .create_encrypted_messages(
                     &recipient,
                     unidentified_access.map(|x| &x.certificate),
@@ -937,25 +982,16 @@ where
                 online,
             };
 
-            let send = if let Some(unidentified) = &unidentified_access {
-                tracing::debug!("sending via unidentified");
-                self.unidentified_ws
-                    .send_messages_unidentified(messages, unidentified)
-                    .await
-            } else {
-                tracing::debug!("sending identified");
-                self.identified_ws.send_messages(messages).await
-            };
-
-            match send {
+            match self.dispatch_outgoing(messages, unidentified_access).await {
                 Ok(SendMessageResponse { needs_sync }) => {
                     tracing::debug!("message sent!");
-                    return Ok(SentMessage {
-                        recipient,
-                        used_identity_key,
-                        unidentified: unidentified_access.is_some(),
-                        needs_sync,
-                    });
+                    return self
+                        .build_sent_message(
+                            recipient,
+                            unidentified_access.is_some(),
+                            needs_sync,
+                        )
+                        .await;
                 },
                 Err(ServiceError::Unauthorized)
                     if unidentified_access.is_some() =>
@@ -963,88 +999,11 @@ where
                     tracing::trace!("unauthorized error using unidentified; retry over identified");
                     unidentified_access = None;
                 },
-                Err(ServiceError::MismatchedDevicesException(ref m)) => {
-                    tracing::debug!("{:?}", m);
-                    for extra_device_id in &m.extra_devices {
-                        tracing::debug!(
-                            "dropping session with device {}",
-                            extra_device_id
-                        );
-                        self.protocol_store
-                            .delete_service_addr_device_session(
-                                &recipient
-                                    .to_protocol_address(*extra_device_id)?,
-                            )
-                            .await?;
-                    }
-
-                    for missing_device_id in &m.missing_devices {
-                        tracing::debug!(
-                            "creating session with missing device {}",
-                            missing_device_id
-                        );
-                        let remote_address = recipient
-                            .to_protocol_address(*missing_device_id)?;
-                        let pre_key = self
-                            .identified_ws
-                            .get_pre_key(&recipient, *missing_device_id)
-                            .await?;
-
-                        process_prekey_bundle(
-                            &remote_address,
-                            &self
-                                .local_aci
-                                .to_protocol_address(self.device_id)
-                                .expect("valid device id"),
-                            &mut self.protocol_store.clone(),
-                            &mut self.protocol_store,
-                            &pre_key,
-                            SystemTime::now(),
-                            &mut rng,
-                        )
-                        .await
-                        .map_err(|e| {
-                            error!("failed to create session: {}", e);
-                            MessageSenderError::UntrustedIdentity {
-                                address: recipient,
-                            }
-                        })?;
-                    }
-                },
-                Err(ServiceError::StaleDevices(ref m)) => {
-                    tracing::debug!("{:?}", m);
-                    for extra_device_id in &m.stale_devices {
-                        tracing::debug!(
-                            "dropping session with device {}",
-                            extra_device_id
-                        );
-                        self.protocol_store
-                            .delete_service_addr_device_session(
-                                &recipient
-                                    .to_protocol_address(*extra_device_id)?,
-                            )
-                            .await?;
-                    }
-                },
-                Err(ServiceError::ProofRequiredError(ref p)) => {
-                    tracing::debug!("{:?}", p);
-                    return Err(MessageSenderError::ProofRequired {
-                        token: p.token.clone(),
-                        options: p.options.clone(),
-                    });
-                },
-                Err(ServiceError::NotFoundError) => {
-                    tracing::debug!("Not found when sending a message");
-                    return Err(MessageSenderError::NotFound {
-                        service_id: recipient,
-                    });
-                },
                 Err(e) => {
-                    tracing::debug!(
-                        "Default error handler for ws.send_messages: {}",
-                        e
-                    );
-                    return Err(MessageSenderError::ServiceError(e));
+                    match self.recover_from_send_error(recipient, e).await? {
+                        SendRecovery::Retry => {},
+                        SendRecovery::Terminal(err) => return Err(err),
+                    }
                 },
             }
         }
@@ -1394,18 +1353,7 @@ where
         if messages.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(EncryptedMessages {
-                messages,
-                used_identity_key: self
-                    .protocol_store
-                    .get_identity(
-                        &recipient.to_protocol_address(*DEFAULT_DEVICE_ID),
-                    )
-                    .await?
-                    .ok_or(MessageSenderError::UntrustedIdentity {
-                        address: *recipient,
-                    })?,
-            }))
+            Ok(Some(EncryptedMessages { messages }))
         }
     }
 
