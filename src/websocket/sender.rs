@@ -1,5 +1,7 @@
 use crate::{
-    push_service::SendMultiRecipientMessageResponse,
+    push_service::{
+        response::ErrorHandlingContext, SendMultiRecipientMessageResponse,
+    },
     sender::{
         MultiRecipientMessagesRequest, OutgoingPushMessages,
         SendMessageResponse,
@@ -29,7 +31,8 @@ impl<C: WebSocketType> SignalWebSocket<C> {
                 messages.destination.service_id_string()
             ))
             .json(&messages)?;
-        self.request_json(request).await
+        self.request_json(request, ErrorHandlingContext::PutMessages)
+            .await
     }
 
     pub async fn send_messages_unidentified(
@@ -47,7 +50,8 @@ impl<C: WebSocketType> SignalWebSocket<C> {
                 BASE64_RELAXED.encode(&access.key),
             )
             .json(&messages)?;
-        self.request_json(request).await
+        self.request_json(request, ErrorHandlingContext::PutMessages)
+            .await
     }
 
     /// `PUT /v1/messages/multi_recipient`: deliver a single Sealed Sender v2

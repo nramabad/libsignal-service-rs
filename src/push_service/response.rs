@@ -18,28 +18,47 @@ where
     })
 }
 
+/// Selects which response-body error shapes apply to a push response.
+///
+/// Most status codes map identically regardless of context; this only
+/// specializes the per-recipient / message-send error bodies.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ErrorHandlingContext {
+    /// Generic fallback for endpoints without a dedicated context.
+    /// Cross-cutting HTTP→error baseline only (auth, rate limit,
+    /// registration lock, …); no message-send body decoding.
+    Default,
+    /// `PUT /v1/messages/{recipient}`: single-recipient `MismatchedDevices` /
+    /// `StaleDevices` (409/410), `ProofRequired` (428), `DeviceLimitReached`
+    /// (411).
+    PutMessages,
+    /// `PUT /v1/messages/multi_recipient`: per-account arrays of
+    /// `AccountMismatchedDevices` / `AccountStaleDevices` (409/410).
+    PutMultiRecipientMessages,
+}
+
 pub(crate) async fn service_error_for_status<R>(
     response: R,
+    context: ErrorHandlingContext,
 ) -> Result<R, ServiceError>
 where
     R: SignalServiceResponse,
     ServiceError: From<<R as SignalServiceResponse>::Error>,
 {
-    match response.status_code() {
-        StatusCode::OK
-        | StatusCode::CREATED
-        | StatusCode::ACCEPTED
-        | StatusCode::NO_CONTENT => Ok(response),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+    match (response.status_code(), context) {
+        (
+            StatusCode::OK
+            | StatusCode::CREATED
+            | StatusCode::ACCEPTED
+            | StatusCode::NO_CONTENT,
+            _,
+        ) => Ok(response),
+        (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _) => {
             Err(ServiceError::Unauthorized)
         },
-        StatusCode::NOT_FOUND => {
-            // This is 404 and means that e.g. recipient is not registered
-            Err(ServiceError::NotFoundError)
-        },
-        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => {
+        (StatusCode::NOT_FOUND, _) => Err(ServiceError::NotFoundError),
+        (StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS, _) => {
             let seconds = response.header("retry-after");
-            // This is 413 and means rate limit exceeded for Signal.
             Err(ServiceError::RateLimitExceeded {
                 retry_after: seconds
                     .and_then(|seconds| {
@@ -55,23 +74,41 @@ where
                     .map(chrono::Duration::seconds),
             })
         },
-        StatusCode::CONFLICT => {
-            let mismatched_devices = json_or_unhandled(response).await?;
-            Err(ServiceError::MismatchedDevicesException(mismatched_devices))
-        },
-        StatusCode::GONE => {
-            let stale_devices = json_or_unhandled(response).await?;
-            Err(ServiceError::StaleDevices(stale_devices))
-        },
-        StatusCode::LOCKED => {
+        // Registration lock (SVR) is cross-cutting: any authenticated
+        // endpoint on a locked account may return 423.
+        (StatusCode::LOCKED, _) => {
             let locked = json_or_unhandled(response).await?;
             Err(ServiceError::Locked(locked))
         },
-        StatusCode::PRECONDITION_REQUIRED => {
+        (StatusCode::CONFLICT, ErrorHandlingContext::PutMessages) => {
+            let mismatched_devices = json_or_unhandled(response).await?;
+            Err(ServiceError::MismatchedDevicesException(mismatched_devices))
+        },
+        (
+            StatusCode::CONFLICT,
+            ErrorHandlingContext::PutMultiRecipientMessages,
+        ) => {
+            let mismatches: Vec<AccountMismatchedDevices> =
+                json_or_unhandled(response).await?;
+            Err(ServiceError::MultiRecipientMismatchedDevices(mismatches))
+        },
+        (StatusCode::GONE, ErrorHandlingContext::PutMessages) => {
+            let stale_devices = json_or_unhandled(response).await?;
+            Err(ServiceError::StaleDevices(stale_devices))
+        },
+        (StatusCode::GONE, ErrorHandlingContext::PutMultiRecipientMessages) => {
+            let stale: Vec<AccountStaleDevices> =
+                json_or_unhandled(response).await?;
+            Err(ServiceError::MultiRecipientStaleDevices(stale))
+        },
+        (
+            StatusCode::PRECONDITION_REQUIRED,
+            ErrorHandlingContext::PutMessages,
+        ) => {
             let proof_required = json_or_unhandled(response).await?;
             Err(ServiceError::ProofRequiredError(proof_required))
         },
-        StatusCode::LENGTH_REQUIRED => {
+        (StatusCode::LENGTH_REQUIRED, ErrorHandlingContext::PutMessages) => {
             #[derive(Debug, serde::Deserialize)]
             struct LinkedDeviceNumberError {
                 current: u32,
@@ -84,68 +121,9 @@ where
                 max: error.max,
             })
         },
-        // XXX: fill in rest from PushServiceSocket
-        code => {
+        (code, _) => {
             let body = response.text().await?;
             tracing::debug!(status_code = %code, %body, "unhandled HTTP response");
-            Err(ServiceError::UnhandledResponseCode { status: code, body })
-        },
-    }
-}
-
-/// Variant of [`service_error_for_status`] for `PUT /v1/messages/multi_recipient`.
-///
-/// The success and rate-limiting limbs match the 1:1 endpoint, but `409`/`410`
-/// carry a JSON array of per-account mismatches (`AccountMismatchedDevices` /
-/// `AccountStaleDevices`) rather than a single per-recipient object — so they
-/// need their own decoding into [`ServiceError::MultiRecipientMismatchedDevices`] /
-/// [`ServiceError::MultiRecipientStaleDevices`].
-pub(crate) async fn service_error_for_status_multi_recipient<R>(
-    response: R,
-) -> Result<R, ServiceError>
-where
-    R: SignalServiceResponse,
-    ServiceError: From<<R as SignalServiceResponse>::Error>,
-{
-    match response.status_code() {
-        StatusCode::OK
-        | StatusCode::CREATED
-        | StatusCode::ACCEPTED
-        | StatusCode::NO_CONTENT => Ok(response),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-            Err(ServiceError::Unauthorized)
-        },
-        StatusCode::NOT_FOUND => Err(ServiceError::NotFoundError),
-        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => {
-            let seconds = response.header("retry-after");
-            Err(ServiceError::RateLimitExceeded {
-                retry_after: seconds
-                    .and_then(|seconds| {
-                        seconds
-                            .parse::<i64>()
-                            .inspect_err(|error| {
-                                tracing::warn!(
-                                    %error, "could not parse rate limit duration"
-                                )
-                            })
-                            .ok()
-                    })
-                    .map(chrono::Duration::seconds),
-            })
-        },
-        StatusCode::CONFLICT => {
-            let mismatches: Vec<AccountMismatchedDevices> =
-                json_or_unhandled(response).await?;
-            Err(ServiceError::MultiRecipientMismatchedDevices(mismatches))
-        },
-        StatusCode::GONE => {
-            let stale: Vec<AccountStaleDevices> =
-                json_or_unhandled(response).await?;
-            Err(ServiceError::MultiRecipientStaleDevices(stale))
-        },
-        code => {
-            let body = response.text().await?;
-            tracing::debug!(status_code = %code, %body, "unhandled HTTP multi-recipient response");
             Err(ServiceError::UnhandledResponseCode { status: code, body })
         },
     }
@@ -232,8 +210,16 @@ pub(crate) trait ReqwestExt
 where
     Self: Sized,
 {
-    /// convenience error handler to be used in the builder-style API of `reqwest::Response`
     async fn service_error_for_status(
+        self,
+    ) -> Result<reqwest::Response, ServiceError>;
+
+    async fn service_error_for_status_with_context(
+        self,
+        context: ErrorHandlingContext,
+    ) -> Result<reqwest::Response, ServiceError>;
+
+    async fn service_error_for_status_multi_recipient(
         self,
     ) -> Result<reqwest::Response, ServiceError>;
 }
@@ -243,6 +229,23 @@ impl ReqwestExt for reqwest::Response {
     async fn service_error_for_status(
         self,
     ) -> Result<reqwest::Response, ServiceError> {
-        service_error_for_status(self).await
+        service_error_for_status(self, ErrorHandlingContext::Default).await
+    }
+
+    async fn service_error_for_status_with_context(
+        self,
+        context: ErrorHandlingContext,
+    ) -> Result<reqwest::Response, ServiceError> {
+        service_error_for_status(self, context).await
+    }
+
+    async fn service_error_for_status_multi_recipient(
+        self,
+    ) -> Result<reqwest::Response, ServiceError> {
+        service_error_for_status(
+            self,
+            ErrorHandlingContext::PutMultiRecipientMessages,
+        )
+        .await
     }
 }

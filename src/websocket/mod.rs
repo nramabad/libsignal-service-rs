@@ -480,13 +480,14 @@ impl<C: WebSocketType> SignalWebSocket<C> {
     pub(crate) async fn request_json<T>(
         &mut self,
         r: WebSocketRequestMessage,
+        context: push_service::response::ErrorHandlingContext,
     ) -> Result<T, ServiceError>
     where
         for<'de> T: serde::Deserialize<'de>,
     {
         self.request(r)
             .await?
-            .service_error_for_status()
+            .service_error_for_status_with_context(context)
             .await?
             .json()
             .await
@@ -495,18 +496,29 @@ impl<C: WebSocketType> SignalWebSocket<C> {
 
 impl WebSocketResponseMessage {
     pub async fn service_error_for_status(self) -> Result<Self, ServiceError> {
-        super::push_service::response::service_error_for_status(self).await
+        super::push_service::response::service_error_for_status(
+            self,
+            super::push_service::response::ErrorHandlingContext::Default,
+        )
+        .await
     }
 
-    /// Like [`service_error_for_status`](Self::service_error_for_status) but
-    /// decodes the 409/410 arrays produced by `PUT /v1/messages/multi_recipient`
-    /// into [`ServiceError::MultiRecipientMismatchedDevices`] /
-    /// [`ServiceError::MultiRecipientStaleDevices`].
+    pub(crate) async fn service_error_for_status_with_context(
+        self,
+        context: super::push_service::response::ErrorHandlingContext,
+    ) -> Result<Self, ServiceError> {
+        super::push_service::response::service_error_for_status(self, context)
+            .await
+    }
+
+    /// Decodes 409/410 for `PUT /v1/messages/multi_recipient` into the
+    /// `MultiRecipient*` variants.
     pub async fn service_error_for_status_multi_recipient(
         self,
     ) -> Result<Self, ServiceError> {
-        super::push_service::response::service_error_for_status_multi_recipient(
+        super::push_service::response::service_error_for_status(
             self,
+            super::push_service::response::ErrorHandlingContext::PutMultiRecipientMessages,
         )
         .await
     }
