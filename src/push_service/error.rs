@@ -11,7 +11,10 @@ use crate::{
     websocket::registration::RegistrationLockFailure,
 };
 
-use super::{MismatchedDevices, ProofRequired, StaleDevices};
+use super::{
+    AccountMismatchedDevices, AccountStaleDevices, MismatchedDevices,
+    ProofRequired, StaleDevices,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ServiceError {
@@ -88,6 +91,16 @@ pub enum ServiceError {
 
     #[error("{0:?}")]
     StaleDevices(StaleDevices),
+
+    /// `409` from `PUT /v1/messages/multi_recipient`: per-recipient
+    /// missing/extra device lists.
+    #[error("{0:?}")]
+    MultiRecipientMismatchedDevices(Vec<AccountMismatchedDevices>),
+
+    /// `410` from `PUT /v1/messages/multi_recipient`: per-recipient stale
+    /// device lists.
+    #[error("{0:?}")]
+    MultiRecipientStaleDevices(Vec<AccountStaleDevices>),
 
     #[error(transparent)]
     CredentialsCacheError(#[from] crate::groups_v2::CredentialsCacheError),

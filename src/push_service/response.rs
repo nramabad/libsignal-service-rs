@@ -2,7 +2,7 @@ use reqwest::StatusCode;
 
 use crate::proto::WebSocketResponseMessage;
 
-use super::ServiceError;
+use super::{AccountMismatchedDevices, AccountStaleDevices, ServiceError};
 
 async fn json_or_unhandled<R, T>(response: R) -> Result<T, ServiceError>
 where
@@ -88,6 +88,64 @@ where
         code => {
             let body = response.text().await?;
             tracing::debug!(status_code = %code, %body, "unhandled HTTP response");
+            Err(ServiceError::UnhandledResponseCode { status: code, body })
+        },
+    }
+}
+
+/// Variant of [`service_error_for_status`] for `PUT /v1/messages/multi_recipient`.
+///
+/// The success and rate-limiting limbs match the 1:1 endpoint, but `409`/`410`
+/// carry a JSON array of per-account mismatches (`AccountMismatchedDevices` /
+/// `AccountStaleDevices`) rather than a single per-recipient object — so they
+/// need their own decoding into [`ServiceError::MultiRecipientMismatchedDevices`] /
+/// [`ServiceError::MultiRecipientStaleDevices`].
+pub(crate) async fn service_error_for_status_multi_recipient<R>(
+    response: R,
+) -> Result<R, ServiceError>
+where
+    R: SignalServiceResponse,
+    ServiceError: From<<R as SignalServiceResponse>::Error>,
+{
+    match response.status_code() {
+        StatusCode::OK
+        | StatusCode::CREATED
+        | StatusCode::ACCEPTED
+        | StatusCode::NO_CONTENT => Ok(response),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Err(ServiceError::Unauthorized)
+        },
+        StatusCode::NOT_FOUND => Err(ServiceError::NotFoundError),
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => {
+            let seconds = response.header("retry-after");
+            Err(ServiceError::RateLimitExceeded {
+                retry_after: seconds
+                    .and_then(|seconds| {
+                        seconds
+                            .parse::<i64>()
+                            .inspect_err(|error| {
+                                tracing::warn!(
+                                    %error, "could not parse rate limit duration"
+                                )
+                            })
+                            .ok()
+                    })
+                    .map(chrono::Duration::seconds),
+            })
+        },
+        StatusCode::CONFLICT => {
+            let mismatches: Vec<AccountMismatchedDevices> =
+                json_or_unhandled(response).await?;
+            Err(ServiceError::MultiRecipientMismatchedDevices(mismatches))
+        },
+        StatusCode::GONE => {
+            let stale: Vec<AccountStaleDevices> =
+                json_or_unhandled(response).await?;
+            Err(ServiceError::MultiRecipientStaleDevices(stale))
+        },
+        code => {
+            let body = response.text().await?;
+            tracing::debug!(status_code = %code, %body, "unhandled HTTP multi-recipient response");
             Err(ServiceError::UnhandledResponseCode { status: code, body })
         },
     }

@@ -498,6 +498,19 @@ impl WebSocketResponseMessage {
         super::push_service::response::service_error_for_status(self).await
     }
 
+    /// Like [`service_error_for_status`](Self::service_error_for_status) but
+    /// decodes the 409/410 arrays produced by `PUT /v1/messages/multi_recipient`
+    /// into [`ServiceError::MultiRecipientMismatchedDevices`] /
+    /// [`ServiceError::MultiRecipientStaleDevices`].
+    pub async fn service_error_for_status_multi_recipient(
+        self,
+    ) -> Result<Self, ServiceError> {
+        super::push_service::response::service_error_for_status_multi_recipient(
+            self,
+        )
+        .await
+    }
+
     pub async fn json<T: for<'a> serde::Deserialize<'a>>(
         &self,
     ) -> Result<T, ServiceError> {
