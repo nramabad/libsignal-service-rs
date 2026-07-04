@@ -149,9 +149,14 @@ where
                 )
                 .await?;
 
+                // SKDM crypto state was applied above. A standalone SKDM has
+                // `content: None`, so `from_proto` returns `UnsupportedContent`
+                // (the SKDM is wire-only; no ContentBody variant represents it).
                 match Content::from_proto(message, plaintext.metadata) {
                     Err(ServiceError::UnsupportedContent) => {
-                        tracing::trace!("Sender key distribution message without additional content");
+                        tracing::trace!(
+                            "SKDM envelope with additional unsupported content"
+                        );
                         return Ok(None);
                     },
                     content => return Ok(Some(content?)),
