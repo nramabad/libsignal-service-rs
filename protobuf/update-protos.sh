@@ -4,7 +4,7 @@ set -euo pipefail
 update_proto() {
 	case "$1" in
 	  Signal-Android)
-	  	git_revision="v8.15.0"
+	  	git_revision="v8.17.3"
         ;;
 	  Signal-Desktop)
 	  	git_revision="v8.14.0"
