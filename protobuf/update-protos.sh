@@ -7,7 +7,7 @@ update_proto() {
 	  	git_revision="v8.17.3"
         ;;
 	  Signal-Desktop)
-	  	git_revision="v8.14.0"
+	  	git_revision="v8.17.0"
         ;;
 	esac
 	curl -LsOf https://raw.githubusercontent.com/signalapp/${1}/${git_revision}/${2}
