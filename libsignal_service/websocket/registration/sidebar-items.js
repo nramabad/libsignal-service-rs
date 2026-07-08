@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["RegistrationMethod","VerificationTransport"],"struct":["AuthCredentials","CaptchaAttributes","DeviceActivationRequest","RegistrationLockFailure","RegistrationSessionMetadataResponse","VerifyAccountResponse"]};
+window.SIDEBAR_ITEMS = {"enum":["RegistrationMethod","VerificationTransport"],"struct":["AuthCredentials","CaptchaAttributes","DeviceActivationRequest","GcmRegistrationId","RegistrationKeyPackage","RegistrationLockFailure","RegistrationSessionMetadataResponse","VerifyAccountResponse"]};
