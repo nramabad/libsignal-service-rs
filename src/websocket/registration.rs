@@ -1,4 +1,4 @@
-use libsignal_protocol::IdentityKeyStore;
+use libsignal_protocol::{GenericSignedPreKey, IdentityKeyStore};
 use rand::{CryptoRng, Rng};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -360,11 +360,11 @@ impl SignalWebSocket<websocket::Unidentified> {
             .await?;
 
         let (
-            _aci_pre_keys,
+            aci_pre_keys,
             aci_signed_pre_key,
-            _aci_kyber_pre_keys,
+            aci_kyber_pre_keys,
             aci_last_resort_kyber_prekey,
-        ) = crate::pre_keys::replenish_pre_keys(
+        ) = crate::pre_keys::generate_pre_keys(
             aci_protocol_store,
             csprng,
             &aci_identity_key_pair,
@@ -374,12 +374,30 @@ impl SignalWebSocket<websocket::Unidentified> {
         )
         .await?;
 
+        // Persist the generated keys
+        for key in &aci_pre_keys {
+            aci_protocol_store.save_pre_key(key.id()?, key).await?;
+        }
+        for key in &aci_kyber_pre_keys {
+            aci_protocol_store
+                .save_kyber_pre_key(key.id()?, key)
+                .await?;
+        }
+        aci_protocol_store
+            .save_signed_pre_key(aci_signed_pre_key.id()?, &aci_signed_pre_key)
+            .await?;
+        if let Some(ref k) = aci_last_resort_kyber_prekey {
+            aci_protocol_store
+                .store_last_resort_kyber_pre_key(k.id()?, k)
+                .await?;
+        }
+
         let (
-            _pni_pre_keys,
+            pni_pre_keys,
             pni_signed_pre_key,
-            _pni_kyber_pre_keys,
+            pni_kyber_pre_keys,
             pni_last_resort_kyber_prekey,
-        ) = crate::pre_keys::replenish_pre_keys(
+        ) = crate::pre_keys::generate_pre_keys(
             pni_protocol_store,
             csprng,
             &pni_identity_key_pair,
@@ -388,6 +406,24 @@ impl SignalWebSocket<websocket::Unidentified> {
             0,
         )
         .await?;
+
+        // Persist the generated keys
+        for key in &pni_pre_keys {
+            pni_protocol_store.save_pre_key(key.id()?, key).await?;
+        }
+        for key in &pni_kyber_pre_keys {
+            pni_protocol_store
+                .save_kyber_pre_key(key.id()?, key)
+                .await?;
+        }
+        pni_protocol_store
+            .save_signed_pre_key(pni_signed_pre_key.id()?, &pni_signed_pre_key)
+            .await?;
+        if let Some(ref k) = pni_last_resort_kyber_prekey {
+            pni_protocol_store
+                .store_last_resort_kyber_pre_key(k.id()?, k)
+                .await?;
+        }
 
         let aci_identity_key = aci_identity_key_pair.identity_key();
         let pni_identity_key = pni_identity_key_pair.identity_key();
