@@ -164,10 +164,18 @@ impl PushService {
         let ws = builder
             .upgrade()
             .send()
-            .await?
+            .await
+            .map_err(|e| {
+                tracing::error!("WS upgrade send FAILED: {:#}", e);
+                e
+            })?
             .into_websocket()
             .instrument(span.clone())
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!("WS into_websocket FAILED: {:#}", e);
+                e
+            })?;
 
         let unidentified_push_service = PushService {
             servers: self.servers,
