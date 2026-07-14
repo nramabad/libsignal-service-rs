@@ -10,9 +10,10 @@ use libsignal_protocol::{
     CiphertextMessageType, DeviceId, IdentityKeyStore, KyberPreKeyStore,
     PlaintextContent, PreKeySignalMessage, PreKeyStore, ProtocolAddress,
     ProtocolStore, PublicKey, SealedSenderDecryptionResult, SenderCertificate,
-    SenderKeyDistributionMessage, SenderKeyStore, ServiceId, SessionStore,
-    SessionUsabilityRequirements, SignalMessage, SignalProtocolError,
-    SignedPreKeyStore, Timestamp, UnidentifiedSenderMessageContent,
+    SenderKeyDistributionMessage, SenderKeyStore, ServiceId, SessionNotFound,
+    SessionStore, SessionUsabilityRequirements, SignalMessage,
+    SignalProtocolError, SignedPreKeyStore, Timestamp,
+    UnidentifiedSenderMessageContent,
 };
 use prost::Message;
 use rand::{rng, CryptoRng, Rng};
@@ -301,7 +302,7 @@ where
                     .protocol_store
                     .load_session(&sender)
                     .await?
-                    .ok_or(SignalProtocolError::SessionNotFound(sender))?;
+                    .ok_or(SignalProtocolError::SessionNotFound(SessionNotFound::new(sender, "load_session")))?;
 
                 strip_padding_version(
                     session_record.session_version()?,
@@ -377,7 +378,7 @@ where
                     .protocol_store
                     .load_session(&sender)
                     .await?
-                    .ok_or(SignalProtocolError::SessionNotFound(sender))?;
+                    .ok_or(SignalProtocolError::SessionNotFound(SessionNotFound::new(sender, "load_session")))?;
 
                 strip_padding_version(
                     session_record.session_version()?,
@@ -487,7 +488,7 @@ where
             .load_session(address)
             .await?
             .ok_or_else(|| {
-            SignalProtocolError::SessionNotFound(address.clone())
+            SignalProtocolError::SessionNotFound(SessionNotFound::new(address.clone(), "encrypt_message"))
         })?;
 
         let record_usable = session_record
@@ -497,7 +498,7 @@ where
             )
             .unwrap_or(false);
         if !record_usable {
-            Err(SignalProtocolError::SessionNotFound(address.clone()))?;
+            Err(SignalProtocolError::SessionNotFound(SessionNotFound::new(address.clone(), "encrypt_message")))?;
         }
 
         let padded_content =
